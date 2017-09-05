@@ -1,0 +1,251 @@
+#!/bin/bash
+# hardkernel CloudShell Screen update
+#
+# requires the following packages:
+# curl sysstat
+#
+# Source http://bazaar.launchpad.net/~kyle1117/+junk/cloudshell-lcd/view/head:/bin/cloudshell-lcd
+
+############## Configuration
+
+# Disable LCD Sleep mode
+echo -e '\033[9;0]' > /dev/tty1
+
+# console font
+# More fonts on: /usr/share/consolefonts
+export TERM="linux"
+export CONSOLE_FONT="Lat7-Fixed18"
+#export CONSOLE_FONT="Lat15-TerminusBold20x10"
+
+# Output Console (ttyX)
+export OUTPUT_CONSOLE="1"
+
+# Network Interface: enx001e06323348, wlan0, ....
+export NETIF=eth0
+
+# Screen refresh in seconds
+export REFRESH="1"
+
+# CPU Temperature in C or F
+export TEMPERATURE_FORMAT="C"
+
+# External IP Refresh counts
+# The time to update the ip in counts is acquired by using the following formula
+# seconds_to_refresh = EXT_IP_REFRESH * REFRESH
+export EXT_IP_REFRESH="10"
+
+# assign the script to cpu0
+PID=$$
+taskset -cp 1 $PID
+
+get_external_ip() {
+	export EXTERNAL_IP=$(/usr/bin/curl -s http://mdrjr.net/ip.php)
+}
+
+get_full_date() {
+	export DATE=$(date +"%Y-%m-%d %H:%M:%S")
+}
+
+get_hostname() {
+	export HOSTNAME=$(hostname)
+}
+
+get_os_distributor() {
+	export OS_DISTRIBUTOR=$(lsb_release -i | awk '{ print $3 }')
+}
+
+get_internal_ip() {
+	export INTERNAL_IP=$(hostname -I | cut -d ' ' -f 1)
+}
+
+get_ethernet_speed() {
+	export SPEED_ETH0=$(cat /sys/class/net/eth*/speed)
+}
+
+get_net_tx_rx_realtime() {
+	local net_txrx=($(sar -n DEV 1 1 | awk '$2 == "'$NETIF'" {printf "%.1f %.1f", $5/1024, $6/1024; exit;}'))
+	export NET_TX=${net_txrx[0]}
+	export NET_RX=${net_txrx[1]}
+}
+
+get_disk_mount_info() {
+	fdisk -l > disks.txt
+	SATA=($(awk '/^\/dev\/sd/ {printf "%s ", $1}' disks.txt))
+	rm disks.txt
+}
+
+
+get_disk_info() {
+	local t=$(df -h)
+	local iostat=$(iostat -y -m 1 1)
+
+	for i in "${!SATA[@]}"
+	do
+		# escape / --> \/
+		escaped_regex="${SATA[$i]//\//\\/}"
+		#DISK_SIZE[$i]=$(echo "$t" | awk '/^'"$escaped_regex"'/ {print $2}')
+		DISK_USED[$i]=$(echo "$t" | awk '/^'"$escaped_regex"'/ {print $3}')
+		DISK_FREE[$i]=$(echo "$t" | awk '/^'"$escaped_regex"'/ {print $4}')
+		DISK_USED_PCT[$i]=$(echo "$t" | awk '/^'"$escaped_regex"'/ {print $5}')
+
+		local SAT=$(expr "${SATA[$i]#"/dev/"}" : '\([a-z]*\)')
+		DISK_R[$i]=$(echo "$iostat" | awk '/^'"$SAT"'/ {print $3}')
+		DISK_W[$i]=$(echo "$iostat" | awk '/^'"$SAT"'/ {print $4}')
+	done
+}
+
+get_disk_temperature() {
+	for i in "${!SATA[@]}"
+	do
+		# declare and assign variable seperately to avoid masking return value
+		DISK_TEMP[$i]=" (IDLE)"
+		if (( ${DISK_R[$i]%.*} > 0 )) || (( ${DISK_W[$i]%.*} > 0 ))
+		then
+
+			local t
+			t=$(smartctl -a "${SATA[$i]}" -d sat | grep "Temp")
+			if (( $? == 0 ))
+			then
+				local temp=$(echo $t | awk '{print $10}')
+				DISK_TEMP[$i]="${CRED} Temp: $temp$TEMPERATURE_FORMAT"
+			else
+				DISK_TEMP[$i]=""
+			fi
+		fi
+	done
+}
+
+get_memory_info() {
+	# in Mbytes
+	export MEM_AVAILABLE=$(awk '/^MemAvailable:/ {printf "%d", $2/1024}' /proc/meminfo)
+	export MEM_TOTAL=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)
+	export MEM_USED=$((MEM_TOTAL - MEM_AVAILABLE))
+}
+
+get_system_info() {
+	export UBUNTU_VERSION=$(lsb_release -r | awk '{print $2}')
+	export KERNEL_VERSION=$(uname -r | awk -F "-" '{print $1}')
+}
+
+get_cpu_usage() { 
+	export CPU_USAGE=$(mpstat 1 1 | awk '/Average/ {printf "%.1f", 100-$12}')
+}
+
+get_cpu_clock() {
+	speed_a7=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
+	speed_a15=$(cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_cur_freq)
+	export SPEED_CPU_A7="$((speed_a7/1000))"
+	export SPEED_CPU_A15="$((speed_a15/1000))"
+}
+
+get_cpu_temperature() {
+	_t=$(($(</sys/class/thermal/thermal_zone0/temp) / 1000))
+	if [ "$TEMPERATURE_FORMAT" = "C" ]; then
+		export CPU_TEMP="$_t"C
+	else
+		_t1=$((_t * 9 / 5 + 32))
+		export CPU_TEMP="$_t1"F
+	fi
+}
+
+get_samba_connections() {
+	if [ ! -f /usr/bin/smbstatus ]; then
+		export SAMBA_CONNECTIONS=0
+	else
+		export SAMBA_CONNECTIONS=$(smbstatus -b | grep -c ipv)
+	fi
+}
+
+get_nfs_connections() { 
+	export NFS_CONNECTIONS=$(netstat -an | grep 2049 | grep -c ESTA)
+}
+
+get_process_count() { 
+	export PROCESS_COUNT=$(ps xa | wc -l)
+}
+
+# local variables
+ext_ip_refresh_c=0
+COFF=$(tput sgr0)
+CGREEN=$(tput setaf 2)
+CRED=$(tput setaf 1)
+CBLUE=$(tput setaf 6)
+oc="/dev/tty$OUTPUT_CONSOLE"
+
+# font setup
+setfont $CONSOLE_FONT > $oc
+
+# Ensure that we are in the right TTY
+chvt $OUTPUT_CONSOLE
+
+# infinite loop
+while true; do
+
+	# Ensure that we are in the right TTY
+	chvt $OUTPUT_CONSOLE
+
+	# check if EXT_IP_REFRESH
+	#if (( (ext_ip_refresh_c % EXT_IP_REFRESH) == 0 )); then
+	#	get_external_ip
+	#fi
+	
+	# increment $ext_ip_refresh_c
+	#ext_ip_refresh_c=$((ext_ip_refresh_c+1))
+
+	# get data
+	get_internal_ip
+	get_ethernet_speed
+	get_hostname
+	get_os_distributor
+	get_disk_mount_info
+	get_disk_info
+	get_disk_temperature
+	get_full_date
+	#get_net_tx_rx_realtime
+	#get_memory_info
+	get_system_info
+	get_cpu_clock
+	get_cpu_usage
+	get_cpu_temperature
+	get_samba_connections
+	get_nfs_connections
+	#get_process_count
+
+	# clear the screen every loop
+	# we only wipe the screen when we are ready to write data to it
+	clear > $oc
+
+	# format the data on screen
+	echo -e "$CBLUE$HOSTNAME $COFF: $DATE" > $oc
+	echo -e "$OS_DISTRIBUTOR $CGREEN$UBUNTU_VERSION$COFF       Kernel $CGREEN$KERNEL_VERSION$COFF" > $oc
+	# line CPU Usage
+	echo -e "CPU Usage: $CBLUE$CPU_USAGE%$COFF  CPU Temp: $CRED$CPU_TEMP$COFF" > $oc
+	echo -e "A15 : $CBLUE$SPEED_CPU_A15 MHz$COFF   A7 : $CBLUE$SPEED_CPU_A7 MHz$COFF" > $oc
+	# Line Memory
+	#echo -e "Memory Free: $CBLUE$MEM_AVAILABLE MB$COFF   Used: $CBLUE$MEM_USED MB$COFF" > $oc
+	# Line IP Addresses
+	#echo -e "IP: $CBLUE$INTERNAL_IP$COFF Ext IP: $CBLUE$EXTERNAL_IP$COFF" > $oc
+	echo -e "IP: $CBLUE$INTERNAL_IP$COFF @ $CBLUE$SPEED_ETH0 Mbps$COFF" > $oc
+	# Line network usage
+	#echo -e "TX: $CBLUE$NET_TX MB/s$COFF RX: $CBLUE$NET_RX MB/s$COFF" > $oc
+	# Line Disk Space
+
+	
+	for i in "${!SATA[@]}"
+	do
+		echo "" > $oc
+		echo -e "${SATA[$i]} ${DISK_TEMP[$i]}$COFF" > $oc
+		echo -e "R/W $CBLUE${DISK_R[$i]}$COFF / $CBLUE${DISK_W[$i]}$COFF MB/s" > $oc
+		#echo -ne "Disk Used: $CBLUE${DISK_USED[$i]}$COFF ($CBLUE${DISK_USED_PCT[$i]}$COFF)  Free: $CBLUE${DISK_FREE[$i]}$COFF" > $oc
+	done
+
+	# Line Samba
+	echo -e "Samba Clients: $CBLUE$SAMBA_CONNECTIONS$COFF" > $oc
+	# Line NFS
+	echo -e "NFS Connections: $CBLUE$NFS_CONNECTIONS$COFF" > $oc
+	# Line Processes
+
+	# sleep
+	sleep $REFRESH
+
+done
