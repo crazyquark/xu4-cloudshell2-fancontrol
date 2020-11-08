@@ -5,10 +5,7 @@ CPU_TEMP_THRESHOLD="60"
 FAN_CHANGED="*"
 
 get_disk_dev_info() {
-    # Pull disk info from /dev/sd*
-    fdisk -l > disks.txt 2>/dev/null
-    SATA=($(awk '/^\/dev\/sd/ {printf "%s ", $1}' disks.txt))
-    rm disks.txt
+    SATA=($(fdisk -l | awk '/^\/dev\/sd/ {printf "%s ", $1}' -))
 }
 
 get_disk_temperature() {
